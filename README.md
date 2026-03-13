@@ -55,11 +55,12 @@ Our model supports a wide range of segmentation tasks and their related applicat
 
 ### :hammer_and_wrench: Installation
 ```shell
-pip3 install torch==1.13.1 torchvision==0.14.1 --extra-index-url https://download.pytorch.org/whl/cu113
+conda create -n semantic-sam python=3.10
+conda activate semantic-sam
+
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 python -m pip install 'git+https://github.com/MaureenZOU/detectron2-xyz.git' --no-build-isolation   
 pip install git+https://github.com/cocodataset/panopticapi.git
-git clone https://github.com/UX-Decoder/Semantic-SAM
-cd Semantic-SAM
 python -m pip install -r requirements.txt
 
 export DATASET=/pth/to/dataset  # path to your coco data
@@ -131,7 +132,48 @@ For mask auto-generation.
 ```shell
 python demo_auto_generation.py --ckpt /your/ckpt/path
 ```
+For plane dection.
+平面检测模块 (Plane Detection) 运行指南
+本模块 plane_detection.py 主要用于多视图 3D 重建（如 3D Gaussian Splatting 的分段或结构化先验约束）前处理阶段。它通过联合输入 RGB 图像与对应的表面法线先验（Surface Normal Priors），在 2D 图像空间中提取并分割共面区域 (Planar Regions)。
 
+模块支持两种运行模式：批量处理模式（针对整个场景目录）和单图调试模式（针对单帧进行算法验证）。
+
+1. 批量处理模式 (Directory Mode)
+这是标准的数据集预处理流程。脚本会遍历指定的输入目录，处理所有配对的 RGB 图像和法线贴图。
+
+运行命令
+Bash
+
+python plane_detection.py \
+  --image /media/wlt/Data/dataset/PlanarGS_dataset/replica/office0/images \
+  --normal /media/wlt/Data/dataset/PlanarGS_dataset/replica/office0/aligned_normals_vis_da3 \
+  --output outputs/replica/office0_with_da3
+参数说明
+--image (str): RGB 图像文件夹的绝对路径。在此示例中，指向 Replica 渲染数据集的 office0 场景图像。
+
+--normal (str): 对齐后的法线贴图文件夹绝对路径。此处使用了基于 DA3 (Depth Anything 3 等单目先验) 生成并视觉化 (vis) 的法线数据。工程假设：该目录下的法线文件名应与 --image 目录下的 RGB 文件名存在严格的对应关系（例如按字典序或同名匹配）。
+
+--output (str): 输出结果的保存目录。算法输出的平面掩码 (Plane Masks) 或可视化结果将保存在此路径下。
+
+2. 单图调试模式 (Single Image Mode)
+在调整平面拟合阈值（如 RANSAC 容差、区域生长法线夹角阈值）或验证边缘检测/法线平滑策略时，建议使用单图模式。
+
+运行命令
+Bash
+
+python plane_detection.py \
+    --image /media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/images/frame_00001.jpg \
+    --normal /media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/stable_normal/normal_vis/frame_00001.png \
+    --output outputs/coffee_room/frame_00001 \
+    --debug
+参数说明
+--image (str): 单张 RGB 图像的绝对路径。
+
+--normal (str): 单张法线贴图的绝对路径。此处使用的是 stable_normal 提取的先验。
+
+--output (str): 单帧输出路径前缀或特定文件夹。
+
+--debug (flag): 开启调试模式。开启后，算法通常会保存中间过程的张量可视化（如：Canny/DiffusionEdge 边缘响应图、法线聚类热力图、剔除小连通域前后的 Mask 状态等），便于分析失败案例 (Failure Cases)。
 ### :sunflower: Evaluation
 We do zero-shot evaluation on COCO val2017.
 `$n` is the number of gpus you use
