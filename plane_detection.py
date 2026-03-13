@@ -36,6 +36,10 @@ ROUNDS = [
 AREA_THRESHOLD = 0.7
 CLUSTER = 5
 MIN_PLANE_PIXELS = 200
+MIN_PLANE_AREA_RATIO = 0.005
+NORMAL_MERGE_COLOR_THRESH = 50.0
+MAX_PLANE_MEAN_ANGLE = 13.0
+MAX_PLANE_P95_ANGLE = 30.0
 
 PALETTE = [
     (230,  25,  75), (60,  180,  75), (255, 225,  25), (  0, 130, 200),
@@ -99,7 +103,7 @@ def merge_similar(masks: list, image_rgb: torch.Tensor, color_thresh: float = 50
         avg_colors.append(avg_color)
 
     merged_masks = []
-    used = torch.zeros(len(masks), dtype=torch.bool)
+    used = torch.zeros(len(masks), dtype=torch.bool, device=image_rgb.device)
 
     for i in range(len(masks)):
         if used[i]:
@@ -117,13 +121,20 @@ def merge_similar(masks: list, image_rgb: torch.Tensor, color_thresh: float = 50
     return merged_masks
 
 
-def SplitPic(image_rgb: torch.Tensor, num_clusters: int = 5) -> list:
+def SplitPic(
+    image_rgb: torch.Tensor,
+    num_clusters: int = 5,
+    merge_clusters: bool = True,
+    color_thresh: float = NORMAL_MERGE_COLOR_THRESH,
+) -> list:
     """
     对法向可视化图像做无监督颜色聚类，返回各聚类对应的空间掩码。
 
     Args:
         image_rgb:    (H, W, 3) float Tensor，法向映射到 [0,255] 的图
-        num_clusters: K-Means 初始簇数
+        num_clusters:   K-Means 初始簇数
+        merge_clusters: 是否合并相近法向簇
+        color_thresh:   法向簇合并阈值
 
     Returns:
         list of (H, W) uint8 Tensor，每个元素为一个聚类区域的掩码
@@ -143,8 +154,154 @@ def SplitPic(image_rgb: torch.Tensor, num_clusters: int = 5) -> list:
         if mask.sum() > 2000:
             masks.append(mask)
 
-    masks = merge_similar(masks, image_rgb)
+    if merge_clusters:
+        masks = merge_similar(masks, image_rgb, color_thresh=color_thresh)
     return masks
+
+
+def largest_connected_component(mask: np.ndarray, min_area: int = 1) -> np.ndarray | None:
+    """
+    返回 mask 的最大连通域。若最大连通域面积小于 min_area，则返回 None。
+    """
+    if not mask.any():
+        return None
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8
+    )
+    if num_labels <= 1:
+        return mask.astype(bool) if int(mask.sum()) >= min_area else None
+
+    component_areas = stats[1:, cv2.CC_STAT_AREA]
+    max_idx = int(component_areas.argmax()) + 1
+    max_area = int(stats[max_idx, cv2.CC_STAT_AREA])
+    if max_area < min_area:
+        return None
+    return (labels == max_idx)
+
+
+def normal_flatness(mask: np.ndarray, normal_tensor: torch.Tensor) -> dict:
+    """
+    统计 mask 内法向相对平均法向的离散度。
+    """
+    if not mask.any():
+        return {
+            "mean_angle": float("inf"),
+            "p95_angle": float("inf"),
+            "mean_normal_norm": 0.0,
+        }
+
+    mask_bool = torch.from_numpy(mask).to(device=normal_tensor.device, dtype=torch.bool)
+    normals = normal_tensor[mask_bool]
+    normals = normals / torch.linalg.norm(normals, dim=-1, keepdim=True).clamp(min=1e-8)
+
+    mean_normal = normals.mean(dim=0)
+    mean_normal_norm = float(torch.linalg.norm(mean_normal).item())
+    if mean_normal_norm < 1e-8:
+        return {
+            "mean_angle": float("inf"),
+            "p95_angle": float("inf"),
+            "mean_normal_norm": 0.0,
+        }
+
+    mean_normal = mean_normal / mean_normal.norm().clamp(min=1e-8)
+    dots = torch.clamp((normals * mean_normal).sum(dim=-1), -1.0, 1.0)
+    angles = torch.rad2deg(torch.arccos(dots))
+
+    return {
+        "mean_angle": float(angles.mean().item()),
+        "p95_angle": float(torch.quantile(angles, 0.95).item()),
+        "mean_normal_norm": mean_normal_norm,
+    }
+
+
+def MaxOverlap(
+    mask: np.ndarray,
+    mask_list: list,
+    area_threshold: float = 0.7,
+) -> tuple:
+    """
+    找到与输入 mask 重叠最大的 1~2 个法向簇。
+    当第一簇没有明显主导时，同时返回第二簇，便于从非平面物体内部切出平面块。
+    """
+    if not mask.any() or len(mask_list) == 0:
+        return None, None, []
+
+    mask_bool = torch.from_numpy(mask).cuda()
+    overlaps = []
+    for idx, cluster_mask in enumerate(mask_list):
+        overlap_area = torch.logical_and(mask_bool, cluster_mask.bool()).sum().item()
+        overlaps.append((int(overlap_area), idx))
+
+    overlaps.sort(key=lambda x: x[0], reverse=True)
+    raw_areas = [area for area, _ in overlaps]
+
+    if overlaps[0][0] == 0:
+        return None, None, raw_areas
+
+    max_area, max_idx = overlaps[0]
+    primary = (mask_list[max_idx], max_area)
+    secondary = None
+
+    if len(overlaps) > 1 and overlaps[1][0] > 0:
+        second_area, second_idx = overlaps[1]
+        ratio = (max_area - second_area) / float(max_area)
+        if ratio <= area_threshold:
+            secondary = (mask_list[second_idx], second_area)
+
+    return primary, secondary, raw_areas
+
+
+def extract_planar_submasks(
+    effective_mask: np.ndarray,
+    color_masks: list,
+    normal_tensor: torch.Tensor,
+    area_threshold: float = AREA_THRESHOLD,
+    min_pixels: int = MIN_PLANE_PIXELS,
+    max_mean_angle: float = MAX_PLANE_MEAN_ANGLE,
+    max_p95_angle: float = MAX_PLANE_P95_ANGLE,
+) -> tuple:
+    """
+    从一个较大的候选 mask 中切出 1~2 个更平坦的子平面。
+    """
+    if not effective_mask.any():
+        return [], []
+
+    mask_area = int(effective_mask.sum())
+    primary, secondary, raw_areas = MaxOverlap(
+        effective_mask, color_masks, area_threshold=area_threshold
+    )
+    if primary is None:
+        return [], raw_areas
+
+    source_mask = torch.from_numpy(effective_mask).cuda()
+    planar_pieces = []
+    for candidate in (primary, secondary):
+        if candidate is None:
+            continue
+
+        cluster_mask, overlap_area = candidate
+        submask = torch.logical_and(source_mask, cluster_mask.bool()).cpu().numpy()
+        submask = largest_connected_component(submask, min_area=min_pixels)
+        if submask is None:
+            continue
+
+        flatness = normal_flatness(submask, normal_tensor)
+        if flatness["mean_angle"] > max_mean_angle:
+            continue
+        if flatness["p95_angle"] > max_p95_angle:
+            continue
+
+        planar_pieces.append({
+            "mask": submask.astype(bool),
+            "ratio": float(overlap_area) / max(mask_area, 1),
+            "mean_angle": flatness["mean_angle"],
+            "p95_angle": flatness["p95_angle"],
+            "mean_normal_norm": flatness["mean_normal_norm"],
+        })
+
+    planar_pieces.sort(key=lambda x: x["ratio"], reverse=True)
+    return planar_pieces, raw_areas
 
 
 # ========================= 掩码生成 =========================
@@ -409,51 +566,6 @@ def _save_debug_round(
     print(f"          累计确认平面: {total_cumulative}")
 
 
-# ========================= 平面判别函数 =========================
-
-def judge_plane(
-    effective_mask: np.ndarray,
-    color_masks: list,
-    area_threshold: float = 0.7,
-) -> tuple:
-    """
-    基于表面法向聚类交叉验证判断二维掩码是否对应单一物理平面。
-
-    思路：如果一个 Mask 在 3D 空间中是真正的平面，那么它绝大部分
-    （主导率 > area_threshold）的像素必然落在同一个法向聚类区域内。
-
-    参数:
-        effective_mask: np.ndarray, 形状 [H, W] 的布尔数组。
-        color_masks:    list[Tensor], SplitPic 返回的法向聚类掩码列表。
-        area_threshold: float, 主导性阈値（默认 0.7）。
-
-    返回:
-        (is_plane: bool, ratio: float)
-            ratio = (max_overlap - second_max_overlap) / max_overlap
-    """
-    if not effective_mask.any():
-        return False, 0.0
-
-    mask_bool = torch.from_numpy(effective_mask).cuda()  # [H, W] bool, on CUDA
-
-    areas = []
-    for m in color_masks:
-        m_bool = m.bool().squeeze()  # [H, W], on CUDA
-        overlap = torch.logical_and(mask_bool, m_bool).sum().item()
-        areas.append(int(overlap))
-
-    areas.sort(reverse=True)
-
-    if len(areas) < 2 or areas[0] == 0:
-        return True, 1.0
-
-    max_area = areas[0]
-    second_max_area = areas[1]
-    ratio = (max_area - second_max_area) / float(max_area)
-
-    return bool(ratio > area_threshold), float(ratio), areas  # areas: sorted desc
-
-
 # ========================= 迭代检测主逻辑 =========================
 
 def detect_planes_iterative(
@@ -472,13 +584,13 @@ def detect_planes_iterative(
     每轮：
         1. 使用当前粒度生成 masks
         2. 仅保留与 remaining 无重叠（或极少重叠）的 mask
-        3. 预计算全图法向聚类（Normal-Cluster Dominance Test）
-        4. 对每个 mask 做主导性判别：主导聚类占比 > area_threshold → 平面
-        5. 确认的平面从 remaining 中剔除
-        6. 非平面丢弃，交由下一轮更细粒度处理
+        3. 预计算全图法向聚类
+        4. 对每个 mask 先按主导法向簇切成 1~2 个子块
+        5. 对子块做法向平坦性筛选，保留更像平面的部分
+        6. 确认的平面子块从 remaining 中剔除
 
     Args:
-        area_threshold: 主导聚类相对占比阈値（默认 0.7）
+        area_threshold: 主导法向簇的分裂阈値（默认 0.7）
         cluster:        法向聚类中心数（默认 3）
         debug_dir:      若不为 None，每轮将中间结果保存到该目录
     """
@@ -489,6 +601,19 @@ def detect_planes_iterative(
     remaining = np.ones((h, w), dtype=bool)
     confirmed_planes = []
     total_pixels = h * w
+    min_plane_area = max(min_pixels, int(np.ceil(total_pixels * MIN_PLANE_AREA_RATIO)))
+    normal_tensor = torch.from_numpy(normal_map).cuda()
+    normal_tensor = normal_tensor / torch.linalg.norm(
+        normal_tensor, dim=-1, keepdim=True
+    ).clamp(min=1e-8)
+    normal_rgb = (normal_tensor + 1.0) * 127.5
+    color_masks = SplitPic(
+        normal_rgb,
+        cluster,
+        merge_clusters=False,
+    )
+    color_masks_np = [m.cpu().numpy().astype(bool) for m in color_masks]
+    normal_rgb_np = normal_rgb.cpu().numpy().clip(0, 255).astype(np.uint8)
 
     for round_idx, round_cfg in enumerate(ROUNDS):
         round_name = round_cfg["name"]
@@ -498,9 +623,10 @@ def detect_planes_iterative(
         print(f"\n{'─' * 70}")
         print(f"▶ Round {round_idx + 1}: {round_name}  |  levels={levels}")
         print(f"  剩余未处理区域: {remaining_ratio:.1f}%")
+        print(f"  平面最小面积: {min_plane_area}px ({MIN_PLANE_AREA_RATIO * 100:.1f}%)")
 
-        if remaining.sum() < min_pixels:
-            print(f"  剩余像素不足 {min_pixels}，跳过")
+        if remaining.sum() < min_plane_area:
+            print(f"  剩余像素不足 {min_plane_area}，跳过")
             continue
 
         remaining_before = remaining.copy()
@@ -512,15 +638,7 @@ def detect_planes_iterative(
 
         masks.sort(key=lambda x: x['area'], reverse=True)
 
-        # 预计算全图法向聚类（每轮一次，所有 mask 共享）
-        normal_tensor = torch.from_numpy(normal_map).cuda()  # (H, W, 3) float32，搬到 CUDA
-        _norm = torch.linalg.norm(normal_tensor, dim=-1, keepdim=True).clamp(min=1e-8)
-        normal_rgb = (normal_tensor / _norm + 1.0) * 127.5  # 映射到 [0, 255]
-        color_masks = SplitPic(normal_rgb, cluster)
         print(f"  法向聚类数: {len(color_masks)}")
-        # 转为 numpy，供 debug 可视化使用
-        color_masks_np = [m.cpu().numpy().astype(bool) for m in color_masks]
-        normal_rgb_np = normal_rgb.cpu().numpy().clip(0, 255).astype(np.uint8)
 
         round_count = 0
         evaluated_records = []   # (effective_mask, ratio, status)
@@ -542,25 +660,49 @@ def detect_planes_iterative(
             # mask 完全位于未处理区域，直接使用原始 seg
             effective_mask = seg
 
-            if effective_mask.sum() < min_pixels:
+            if effective_mask.sum() < min_plane_area:
                 evaluated_records.append((effective_mask, 0.0, 'skipped', []))
                 continue
 
-            # ===== 法向聚类主导性判别 =====
-            is_plane, ratio, raw_areas = judge_plane(effective_mask, color_masks, area_threshold)
+            # ===== 从候选 mask 内部提取更平坦的子平面 =====
+            planar_pieces, raw_areas = extract_planar_submasks(
+                effective_mask,
+                color_masks,
+                normal_tensor,
+                area_threshold=area_threshold,
+                min_pixels=min_plane_area,
+            )
 
-            if is_plane:
-                confirmed_planes.append({
-                    'mask': effective_mask.copy(),
-                    'round': round_name,
-                    'area': int(effective_mask.sum()),
-                    'ratio': float(ratio),
-                })
-                remaining[effective_mask] = False
-                round_count += 1
-                evaluated_records.append((effective_mask, ratio, 'planar', raw_areas))
-            else:
-                evaluated_records.append((effective_mask, ratio, 'rejected', raw_areas))
+            if planar_pieces:
+                accepted = 0
+                for piece in planar_pieces:
+                    piece_mask = piece['mask']
+                    if int(piece_mask.sum()) < min_plane_area:
+                        continue
+
+                    confirmed_planes.append({
+                        'mask': piece_mask.copy(),
+                        'round': round_name,
+                        'area': int(piece_mask.sum()),
+                        'ratio': float(piece['ratio']),
+                        'mean_angle': float(piece['mean_angle']),
+                        'p95_angle': float(piece['p95_angle']),
+                    })
+                    remaining[piece_mask] = False
+                    round_count += 1
+                    accepted += 1
+                    evaluated_records.append((
+                        piece_mask,
+                        piece['ratio'],
+                        'planar',
+                        raw_areas,
+                    ))
+
+                if accepted > 0:
+                    continue
+
+            best_ratio = (raw_areas[0] / float(mask_area)) if raw_areas and mask_area > 0 else 0.0
+            evaluated_records.append((effective_mask, best_ratio, 'rejected', raw_areas))
 
         n_rejected = sum(1 for r in evaluated_records if r[2] == 'rejected')
         n_skipped  = sum(1 for r in evaluated_records if r[2] == 'skipped')
@@ -781,7 +923,9 @@ def main():
         print(
             f"    #{i:03d}  {p['round']:<10s}  "
             f"area={p['area']:>8d}px ({p['area']/total_pixels*100:>5.1f}%)  "
-            f"ratio={p['ratio']:.3f}"
+            f"ratio={p['ratio']:.3f}  "
+            f"mean={p.get('mean_angle', 0.0):>5.1f}deg  "
+            f"p95={p.get('p95_angle', 0.0):>5.1f}deg"
         )
 
     print(f"\n  输出文件:")
