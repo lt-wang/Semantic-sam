@@ -30,15 +30,18 @@ CFG_PATH = "configs/semantic_sam_only_sa-1b_swinL.yaml"
 # ]
 
 ROUNDS = [
-    {"name": "semantic", "levels": [1,2]},
-    {"name": "instance", "levels": [1,2,3]},
-    {"name": "part",     "levels": [1,2,3,4,5,6]},
+    {"name": "semantic", "levels": [2]},
+    {"name": "instance", "levels": [3]},
+    {"name": "part",     "levels": [6]},
 ]
 AREA_THRESHOLD = 0.7
 CLUSTER = 5
-MIN_PLANE_PIXELS = 200
+MIN_PLANE_PIXELS = 2000
 MIN_PLANE_AREA_RATIO = 0.005
 NORMAL_MERGE_COLOR_THRESH = 50.0
+NORMAL_EDGE_CANNY_LOW = 50
+NORMAL_EDGE_CANNY_HIGH = 100
+NORMAL_EDGE_DILATE = 3
 MAX_PLANE_MEAN_ANGLE = 13.0
 MAX_PLANE_P95_ANGLE = 30.0
 RANDOM_SEED = 22
@@ -235,6 +238,72 @@ def normal_flatness(mask: np.ndarray, normal_tensor: torch.Tensor) -> dict:
     }
 
 
+def compute_normal_edge_map(
+    normal_map: np.ndarray,
+    canny_low: int = NORMAL_EDGE_CANNY_LOW,
+    canny_high: int = NORMAL_EDGE_CANNY_HIGH,
+    dilate_kernel: int = NORMAL_EDGE_DILATE,
+) -> np.ndarray:
+    """
+    从法线图提取 Sobel 梯度边缘，并做轻微膨胀，便于把相邻平面切开。
+    """
+    normal_float = normal_map.astype(np.float32)
+    edge_maps = []
+    for c in range(normal_float.shape[2]):
+        channel = normal_float[:, :, c]
+        grad_x = cv2.Sobel(channel, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(channel, cv2.CV_32F, 0, 1, ksize=3)
+        gradient = np.sqrt(grad_x ** 2 + grad_y ** 2)
+        edge_maps.append(gradient)
+
+    combined_gradient = np.maximum.reduce(edge_maps)
+    if combined_gradient.max() > 0:
+        combined_gradient = (
+            combined_gradient / combined_gradient.max() * 255.0
+        ).astype(np.uint8)
+    else:
+        combined_gradient = combined_gradient.astype(np.uint8)
+
+    edges = cv2.Canny(combined_gradient, canny_low, canny_high)
+    if dilate_kernel > 1:
+        kernel = np.ones((dilate_kernel, dilate_kernel), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=1)
+    return edges > 0
+
+
+def split_mask_by_normal_edges(
+    mask: np.ndarray,
+    normal_edge: np.ndarray,
+    min_pixels: int,
+) -> list:
+    """
+    用 normal_edge 从候选 mask 中剔除转角/边界像素，再按连通域拆分。
+    """
+    if not mask.any():
+        return []
+
+    split_mask = np.logical_and(mask, np.logical_not(normal_edge))
+    if not split_mask.any():
+        return []
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        split_mask.astype(np.uint8), connectivity=8
+    )
+
+    components = []
+    for comp_id in range(1, num_labels):
+        area = int(stats[comp_id, cv2.CC_STAT_AREA])
+        if area < min_pixels:
+            continue
+        components.append(labels == comp_id)
+
+    if components:
+        return components
+
+    largest = largest_connected_component(split_mask, min_area=min_pixels)
+    return [largest] if largest is not None else []
+
+
 def MaxOverlap(
     mask: np.ndarray,
     mask_list: list,
@@ -370,6 +439,7 @@ def _save_debug_round(
     cumulative_planes: list,   # ALL confirmed planes so far (across all rounds)
     color_masks_np: list,      # list of (H, W) bool np.ndarray，法向聚类区域
     normal_rgb_np: np.ndarray, # (H, W, 3) uint8，法向映射到 [0,255] 的图
+    normal_edge_np: np.ndarray,# (H, W) bool，normal_rgb 上的边缘
     debug_dir: Path,
 ):
     """
@@ -384,6 +454,7 @@ def _save_debug_round(
         06_summary_grid.png      — 上述 5 张并排总览
         07_{round_name}_planar.png — 累计已确认平面（含之前所有轮次）
         08_cluster_map.png         — 本轮法向聚类区域可视化
+        09_normal_edge.png         — 本轮 normal_rgb 的边缘图
         all_masks/                 — 本轮生成器输出的所有原始 mask
             mask_{j:03d}.png
         evaluated/
@@ -524,6 +595,11 @@ def _save_debug_round(
     Image.fromarray(cluster_map_blend).save(rdir / "08_cluster_map.png")
     Image.fromarray(cluster_map_blend).save(debug_dir / f"{round_name}_cluster_map.png")
 
+    # ── 09 normal edge 可视化 ─────────────────────────────────────────
+    normal_edge_img = (normal_edge_np.astype(np.uint8) * 255)
+    Image.fromarray(normal_edge_img, mode='L').save(rdir / "09_normal_edge.png")
+    Image.fromarray(normal_edge_img, mode='L').save(debug_dir / f"{round_name}_normal_edge.png")
+
     # ── per-mask evaluated images ──────────────────────────────────────────
     for j, (eff_mask, ratio, status, raw_areas) in enumerate(evaluated_records):
         canvas = image_np.copy().astype(np.float64)
@@ -634,6 +710,8 @@ def detect_planes_iterative(
     )
     color_masks_np = [m.cpu().numpy().astype(bool) for m in color_masks]
     normal_rgb_np = normal_rgb.cpu().numpy().clip(0, 255).astype(np.uint8)
+    normal_edge = compute_normal_edge_map(normal_map)
+    print(f"  normal_edge 像素数: {int(normal_edge.sum())}")
 
     for round_idx, round_cfg in enumerate(ROUNDS):
         round_name = round_cfg["name"]
@@ -684,20 +762,44 @@ def detect_planes_iterative(
                 evaluated_records.append((effective_mask, 0.0, 'skipped', []))
                 continue
 
-            # ===== 从候选 mask 内部提取更平坦的子平面 =====
-            planar_pieces, raw_areas = extract_planar_submasks(
+            split_masks = split_mask_by_normal_edges(
                 effective_mask,
-                color_masks,
-                normal_tensor,
-                area_threshold=area_threshold,
-                min_pixels=min_plane_area,
+                normal_edge,
+                min_plane_area,
             )
+            if not split_masks:
+                split_masks = [effective_mask]
 
-            if planar_pieces:
-                accepted = 0
+            accepted = 0
+            best_ratio = 0.0
+            best_raw_areas = []
+
+            for split_mask in split_masks:
+                if int(split_mask.sum()) < min_plane_area:
+                    continue
+
+                # ===== 从候选子块内部提取更平坦的子平面 =====
+                planar_pieces, raw_areas = extract_planar_submasks(
+                    split_mask,
+                    color_masks,
+                    normal_tensor,
+                    area_threshold=area_threshold,
+                    min_pixels=min_plane_area,
+                )
+
+                if raw_areas:
+                    split_ratio = raw_areas[0] / float(max(int(split_mask.sum()), 1))
+                    if split_ratio > best_ratio:
+                        best_ratio = split_ratio
+                        best_raw_areas = raw_areas
+
+                if not planar_pieces:
+                    continue
+
                 for piece in planar_pieces:
-                    piece_mask = piece['mask']
-                    if int(piece_mask.sum()) < min_plane_area:
+                    piece_mask = np.logical_and(piece['mask'], np.logical_not(normal_edge))
+                    piece_mask = largest_connected_component(piece_mask, min_area=min_plane_area)
+                    if piece_mask is None or int(piece_mask.sum()) < min_plane_area:
                         continue
 
                     confirmed_planes.append({
@@ -718,11 +820,10 @@ def detect_planes_iterative(
                         raw_areas,
                     ))
 
-                if accepted > 0:
-                    continue
+            if accepted > 0:
+                continue
 
-            best_ratio = (raw_areas[0] / float(mask_area)) if raw_areas and mask_area > 0 else 0.0
-            evaluated_records.append((effective_mask, best_ratio, 'rejected', raw_areas))
+            evaluated_records.append((effective_mask, best_ratio, 'rejected', best_raw_areas))
 
         n_rejected = sum(1 for r in evaluated_records if r[2] == 'rejected')
         n_skipped  = sum(1 for r in evaluated_records if r[2] == 'skipped')
@@ -742,6 +843,7 @@ def detect_planes_iterative(
                 confirmed_planes,
                 color_masks_np,
                 normal_rgb_np,
+                normal_edge,
                 debug_dir,
             )
 
@@ -753,19 +855,21 @@ def detect_planes_iterative(
 def visualize_planes(
     image_np: np.ndarray,
     confirmed_planes: list,
-    output_dir: Path,
+    mask_output_dir: Path,
+    vis_output_dir: Path,
     image_stem: str,
     debug: bool = False,
 ):
     h, w = image_np.shape[:2]
-    output_dir.mkdir(parents=True, exist_ok=True)
+    mask_output_dir.mkdir(parents=True, exist_ok=True)
+    vis_output_dir.mkdir(parents=True, exist_ok=True)
 
     colored = np.zeros((h, w, 3), dtype=np.uint8)
     index_map = np.zeros((h, w), dtype=np.uint16)
     overlay = image_np.copy().astype(np.float64) if debug else None
     individual_dir = None
     if debug:
-        individual_dir = output_dir / f"{image_stem}_planes_individual"
+        individual_dir = vis_output_dir / f"{image_stem}_planes_individual"
         individual_dir.mkdir(exist_ok=True)
 
     planes_sorted = sorted(confirmed_planes, key=lambda p: p['area'], reverse=True)
@@ -790,21 +894,195 @@ def visualize_planes(
             single_path = individual_dir / f"plane_{i:03d}_{plane['round']}.png"
             Image.fromarray(single).save(single_path)
 
-    colored_path = output_dir / f"{image_stem}_vis.png"
+    colored_path = vis_output_dir / f"{image_stem}_vis.png"
     Image.fromarray(colored).save(colored_path)
 
     overlay_path = None
     if debug:
-        overlay_path = output_dir / f"{image_stem}_overlay.png"
+        overlay_path = vis_output_dir / f"{image_stem}_overlay.png"
         Image.fromarray(overlay.astype(np.uint8)).save(overlay_path)
 
-    index_path = output_dir / f"{image_stem}.npy"
+    index_path = mask_output_dir / f"{image_stem}.npy"
     np.save(index_path, index_map)
 
     return colored_path, overlay_path, index_path
 
 
 # ========================= 主函数 =========================
+
+def load_normal_map(normal_path: Path) -> np.ndarray:
+    print(f"\n[INFO] 加载法线图: {normal_path}")
+    normal_ext = normal_path.suffix.lower()
+    if normal_ext == '.npy':
+        normal_map = np.load(normal_path).astype(np.float32)
+        print(f"       格式: .npy  shape={normal_map.shape}")
+    else:
+        vis_img = np.asarray(Image.open(normal_path).convert('RGB')).astype(np.float32)
+        normal_map = vis_img / 255.0 * 2.0 - 1.0
+        norms = np.linalg.norm(normal_map, axis=-1, keepdims=True)
+        norms = np.where(norms < 1e-6, 1.0, norms)
+        normal_map = (normal_map / norms).astype(np.float32)
+        print(f"       格式: 可视化图像  shape={normal_map.shape}")
+        print(f"       已从 pixel 反推并重归一化")
+        sample_norms = np.linalg.norm(normal_map.reshape(-1, 3), axis=1)
+        print(
+            f"       模长检查: min={sample_norms.min():.4f}, "
+            f"max={sample_norms.max():.4f}, mean={sample_norms.mean():.4f}"
+        )
+    print(f"       shape={normal_map.shape}, dtype={normal_map.dtype}")
+    return normal_map
+
+
+def collect_input_pairs(image_input: Path, normal_input: Path) -> list:
+    image_suffixes = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    normal_suffix_priority = ['.npy', '.png', '.jpg', '.jpeg', '.bmp', '.webp']
+
+    if image_input.is_dir() != normal_input.is_dir():
+        raise ValueError("--image 和 --normal 必须同时是文件，或同时是文件夹。")
+
+    if image_input.is_file():
+        return [(image_input, normal_input)]
+
+    image_files = {
+        p.stem: p
+        for p in sorted(image_input.iterdir())
+        if p.is_file() and p.suffix.lower() in image_suffixes
+    }
+
+    normal_files = {}
+    for p in sorted(normal_input.iterdir()):
+        if not p.is_file():
+            continue
+        suffix = p.suffix.lower()
+        if suffix not in normal_suffix_priority:
+            continue
+        stem = p.stem
+        if stem not in normal_files:
+            normal_files[stem] = p
+            continue
+        old_idx = normal_suffix_priority.index(normal_files[stem].suffix.lower())
+        new_idx = normal_suffix_priority.index(suffix)
+        if new_idx < old_idx:
+            normal_files[stem] = p
+
+    common_stems = sorted(set(image_files) & set(normal_files))
+    missing_normals = sorted(set(image_files) - set(normal_files))
+    missing_images = sorted(set(normal_files) - set(image_files))
+
+    if missing_normals:
+        print(f"[WARN] 以下 image 没有匹配到 normal，已跳过: {missing_normals[:10]}")
+    if missing_images:
+        print(f"[WARN] 以下 normal 没有匹配到 image，已跳过: {missing_images[:10]}")
+    if not common_stems:
+        raise ValueError("输入文件夹中没有找到同 stem 的 image/normal 配对。")
+
+    return [(image_files[stem], normal_files[stem]) for stem in common_stems]
+
+
+def process_single_image(
+    model,
+    image_path: Path,
+    normal_path: Path,
+    mask_output_dir: Path,
+    vis_output_dir: Path,
+    area_threshold: float,
+    cluster: int,
+    min_pixels: int,
+    text_size: int,
+    debug_enabled: bool,
+):
+    normal_map = load_normal_map(normal_path)
+
+    print(f"[INFO] 加载图像:   {image_path}")
+    image = Image.open(image_path).convert('RGB')
+    image_np = np.asarray(image)
+    h, w = image_np.shape[:2]
+    print(f"       尺寸: {w} x {h}")
+
+    assert normal_map.shape[0] == h and normal_map.shape[1] == w, (
+        f"法线图尺寸 {normal_map.shape[:2]} 与图像尺寸 ({h}, {w}) 不匹配！"
+    )
+
+    debug_dir = vis_output_dir / f"{image_path.stem}_debug" if debug_enabled else None
+
+    print(f"\n[INFO] 开始多粒度平面检测")
+    print(f"       area_threshold={area_threshold}, cluster={cluster}, min_pixels={min_pixels}")
+    if debug_enabled:
+        print(f"       debug 输出: {debug_dir}")
+
+    confirmed_planes = detect_planes_iterative(
+        model,
+        image,
+        normal_map,
+        area_threshold=area_threshold,
+        cluster=cluster,
+        min_pixels=min_pixels,
+        text_size=text_size,
+        debug_dir=debug_dir,
+    )
+
+    print(f"\n{'─' * 70}")
+    print(f"[INFO] 生成最终可视化...")
+    colored_path, overlay_path, index_path = visualize_planes(
+        image_np,
+        confirmed_planes,
+        mask_output_dir,
+        vis_output_dir,
+        image_stem=image_path.stem,
+        debug=debug_enabled,
+    )
+
+    total_pixels = h * w
+    total_plane_pixels = sum(p['area'] for p in confirmed_planes)
+
+    print(f"\n{'=' * 70}")
+    print(f"  📊 检测结果统计")
+    print(f"{'=' * 70}\n")
+    print(f"  检测到平面数: {len(confirmed_planes)}")
+    print(f"  平面总覆盖率: {total_plane_pixels / total_pixels * 100:.1f}%\n")
+
+    round_stats = {}
+    for p in confirmed_planes:
+        r = p['round']
+        round_stats.setdefault(r, {'count': 0, 'area': 0})
+        round_stats[r]['count'] += 1
+        round_stats[r]['area'] += p['area']
+
+    print(f"  {'轮次':<12s} {'平面数':>6s} {'覆盖率':>8s}")
+    print(f"  {'─' * 30}")
+    for r_name in ['semantic', 'instance', 'part']:
+        if r_name in round_stats:
+            s = round_stats[r_name]
+            print(f"  {r_name:<12s} {s['count']:>6d} {s['area']/total_pixels*100:>7.1f}%")
+
+    print(f"\n  各平面详情 (按面积排序):")
+    planes_sorted = sorted(confirmed_planes, key=lambda p: p['area'], reverse=True)
+    for i, p in enumerate(planes_sorted):
+        print(
+            f"    #{i:03d}  {p['round']:<10s}  "
+            f"area={p['area']:>8d}px ({p['area']/total_pixels*100:>5.1f}%)  "
+            f"ratio={p['ratio']:.3f}  "
+            f"mean={p.get('mean_angle', 0.0):>5.1f}deg  "
+            f"p95={p.get('p95_angle', 0.0):>5.1f}deg"
+        )
+
+    print(f"\n  输出文件:")
+    print(f"    mask:    {index_path}")
+    print(f"    vis:     {colored_path}")
+    if debug_enabled and overlay_path is not None:
+        print(f"    overlay: {overlay_path}")
+        print(f"    indiv:   {vis_output_dir / f'{image_path.stem}_planes_individual'}/")
+        print(f"    debug:   {debug_dir}/")
+    print(f"\n{'=' * 70}\n")
+
+    return {
+        "image": image_path,
+        "normal": normal_path,
+        "mask_path": index_path,
+        "vis_path": colored_path,
+        "overlay_path": overlay_path,
+        "num_planes": len(confirmed_planes),
+    }
 
 def main():
     seed_everything(RANDOM_SEED)
@@ -857,49 +1135,17 @@ def main():
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
+    mask_output_dir = output_dir / "planarmask"
+    vis_output_dir = output_dir / "planar_vis"
+    mask_output_dir.mkdir(parents=True, exist_ok=True)
+    vis_output_dir.mkdir(parents=True, exist_ok=True)
     debug_enabled = args.debug and not args.no_debug
-    debug_dir = output_dir / "debug" if debug_enabled else None
+    image_input = Path(args.image)
+    normal_input = Path(args.normal)
 
     print("=" * 70)
     print("  Plane Detection: Normal-Cluster Dominance Test")
     print("=" * 70)
-
-    # ---- 加载法线图 ----
-    print(f"\n[INFO] 加载法线图: {args.normal}")
-    normal_ext = Path(args.normal).suffix.lower()
-    if normal_ext == '.npy':
-        # 格式 1：直接加载已归一化法线
-        normal_map = np.load(args.normal).astype(np.float32)  # (H, W, 3)
-        print(f"       格式: .npy  shape={normal_map.shape}")
-    else:
-        # 格式 2：从可视化图像反推法线
-        # 可视化公式： pixel = (normal + 1.0) * 0.5 * 255
-        # 反推公式： normal = pixel / 255.0 * 2.0 - 1.0
-        vis_img = np.asarray(Image.open(args.normal).convert('RGB')).astype(np.float32)
-        normal_map = vis_img / 255.0 * 2.0 - 1.0  # 映射回 [-1, 1]
-        # JPEG 有损压缩会微小改变数候，重归一化保证是单位向量
-        norms = np.linalg.norm(normal_map, axis=-1, keepdims=True)
-        norms = np.where(norms < 1e-6, 1.0, norms)  # 防止除零
-        normal_map = (normal_map / norms).astype(np.float32)
-        print(f"       格式: 可视化图像  shape={normal_map.shape}")
-        print(f"       已从 pixel 反推并重归一化")
-        # 输出简单检查
-        sample_norms = np.linalg.norm(normal_map.reshape(-1,3), axis=1)
-        print(f"       模长检查: min={sample_norms.min():.4f}, "
-              f"max={sample_norms.max():.4f}, mean={sample_norms.mean():.4f}")
-    print(f"       shape={normal_map.shape}, dtype={normal_map.dtype}")
-
-    # ---- 加载图像 ----
-    print(f"[INFO] 加载图像:   {args.image}")
-    image_path = Path(args.image)
-    image = Image.open(args.image).convert('RGB')
-    image_np = np.asarray(image)
-    h, w = image_np.shape[:2]
-    print(f"       尺寸: {w} x {h}")
-
-    assert normal_map.shape[0] == h and normal_map.shape[1] == w, (
-        f"法线图尺寸 {normal_map.shape[:2]} 与图像尺寸 ({h}, {w}) 不匹配！"
-    )
 
     # ---- 加载模型 ----
     print(f"\n[INFO] 加载 Semantic-SAM 模型...")
@@ -912,84 +1158,53 @@ def main():
     )
     print(f"       ✓ 模型就绪")
 
-    # ---- 迭代检测 ----
-    print(f"\n[INFO] 开始多粒度平面检测")
-    print(f"       area_threshold={args.area_threshold}, cluster={args.cluster}, min_pixels={args.min_pixels}")
-    if debug_enabled:
-        print(f"       debug 输出: {debug_dir}")
+    input_pairs = collect_input_pairs(image_input, normal_input)
+    if image_input.is_dir():
+        print(f"\n[INFO] 批量处理模式")
+        print(f"       image dir:  {image_input}")
+        print(f"       normal dir: {normal_input}")
+        print(f"       配对数量:    {len(input_pairs)}")
 
-    confirmed_planes = detect_planes_iterative(
-        model, image, normal_map,
-        area_threshold=args.area_threshold,
-        cluster=args.cluster,
-        min_pixels=args.min_pixels,
-        text_size=args.text_size,
-        debug_dir=debug_dir,
-    )
-
-    # ---- 可视化 ----
-    print(f"\n{'─' * 70}")
-    print(f"[INFO] 生成最终可视化...")
-    colored_path, overlay_path, index_path = visualize_planes(
-        image_np,
-        confirmed_planes,
-        output_dir,
-        image_stem=image_path.stem,
-        debug=debug_enabled,
-    )
-
-    # ---- 统计报告 ----
-    total_pixels = h * w
-    total_plane_pixels = sum(p['area'] for p in confirmed_planes)
+    results = []
+    for idx, (image_path, normal_path) in enumerate(input_pairs, start=1):
+        print(f"\n{'#' * 70}")
+        print(f"[INFO] ({idx}/{len(input_pairs)}) 处理 {image_path.stem}")
+        print(f"{'#' * 70}")
+        result = process_single_image(
+            model,
+            image_path,
+            normal_path,
+            mask_output_dir,
+            vis_output_dir,
+            area_threshold=args.area_threshold,
+            cluster=args.cluster,
+            min_pixels=args.min_pixels,
+            text_size=args.text_size,
+            debug_enabled=debug_enabled,
+        )
+        results.append(result)
 
     print(f"\n{'=' * 70}")
-    print(f"  📊 检测结果统计")
+    print("  全部处理完成")
+    print(f"{'=' * 70}")
+    print(f"  npy 目录: {mask_output_dir}")
+    print(f"  vis 目录: {vis_output_dir}")
+    print(f"  处理数量: {len(results)}")
     print(f"{'=' * 70}\n")
-    print(f"  检测到平面数: {len(confirmed_planes)}")
-    print(f"  平面总覆盖率: {total_plane_pixels / total_pixels * 100:.1f}%\n")
-
-    round_stats = {}
-    for p in confirmed_planes:
-        r = p['round']
-        round_stats.setdefault(r, {'count': 0, 'area': 0})
-        round_stats[r]['count'] += 1
-        round_stats[r]['area'] += p['area']
-
-    print(f"  {'轮次':<12s} {'平面数':>6s} {'覆盖率':>8s}")
-    print(f"  {'─' * 30}")
-    for r_name in ['semantic', 'instance', 'part']:
-        if r_name in round_stats:
-            s = round_stats[r_name]
-            print(f"  {r_name:<12s} {s['count']:>6d} {s['area']/total_pixels*100:>7.1f}%")
-
-    print(f"\n  各平面详情 (按面积排序):")
-    planes_sorted = sorted(confirmed_planes, key=lambda p: p['area'], reverse=True)
-    for i, p in enumerate(planes_sorted):
-        print(
-            f"    #{i:03d}  {p['round']:<10s}  "
-            f"area={p['area']:>8d}px ({p['area']/total_pixels*100:>5.1f}%)  "
-            f"ratio={p['ratio']:.3f}  "
-            f"mean={p.get('mean_angle', 0.0):>5.1f}deg  "
-            f"p95={p.get('p95_angle', 0.0):>5.1f}deg"
-        )
-
-    print(f"\n  输出文件:")
-    print(f"    纯色图:  {colored_path}")
-    print(f"    索引图:  {index_path}")
-    if debug_enabled and overlay_path is not None:
-        print(f"    叠加图:  {overlay_path}")
-        print(f"    单独图:  {output_dir / f'{image_path.stem}_planes_individual'}/")
-        print(f"    Debug:   {debug_dir}/")
-    print(f"\n{'=' * 70}\n")
 
 
 if __name__ == '__main__':
     main()
 
+# 单张图像
 # python plane_detection.py \
-#     --image /media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/images/frame_00011.jpg \
-#     --normal /media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/stable_normal/normal_vis/frame_00011.png \
-#     --output outputs/coffee_room/plane_detection \
-#     --area-threshold 0.7 \
-#     --cluster 5 \
-#     --min-pixels 200
+#     --image /media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/images/frame_00001.jpg \
+#     --normal /media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/stable_normal/normal_vis/frame_00001.png \
+#     --output outputs/coffee_room/frame_00001 \
+#    --debug
+
+# 批量处理
+# python plane_detection.py \
+#   --image /media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/images \
+#   --normal /media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/stable_normal/normal_vis \
+#   --output outputs/mushroom/coffee_room

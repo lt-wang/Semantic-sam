@@ -17,7 +17,7 @@ from tasks.automatic_mask_generator import SemanticSamAutomaticMaskGenerator
 # 配置
 PROJECT_ROOT = Path(__file__).parent
 CKPT_PATH = PROJECT_ROOT / "ckpts" / "swinl_only_sam_many2many.pth"
-INPUT_IMAGE = PROJECT_ROOT / "examples" / "frame_00011.jpg"
+INPUT_IMAGE = "/media/wlt/Data/dataset/PlanarGS_dataset/mushroom/coffee_room/images/frame_00001.jpg"
 CFG_PATH = "configs/semantic_sam_only_sa-1b_swinL.yaml"
 
 # 加载模型
