@@ -5,6 +5,7 @@
 # --------------------------------------------------------
 
 import argparse
+import random
 import torch
 import numpy as np
 from PIL import Image
@@ -29,9 +30,9 @@ CFG_PATH = "configs/semantic_sam_only_sa-1b_swinL.yaml"
 # ]
 
 ROUNDS = [
-    {"name": "semantic", "levels": [2]},
-    {"name": "instance", "levels": [3]},
-    {"name": "part",     "levels": [5]},
+    {"name": "semantic", "levels": [1,2]},
+    {"name": "instance", "levels": [1,2,3]},
+    {"name": "part",     "levels": [1,2,3,4,5,6]},
 ]
 AREA_THRESHOLD = 0.7
 CLUSTER = 5
@@ -40,6 +41,7 @@ MIN_PLANE_AREA_RATIO = 0.005
 NORMAL_MERGE_COLOR_THRESH = 50.0
 MAX_PLANE_MEAN_ANGLE = 13.0
 MAX_PLANE_P95_ANGLE = 30.0
+RANDOM_SEED = 22
 
 PALETTE = [
     (230,  25,  75), (60,  180,  75), (255, 225,  25), (  0, 130, 200),
@@ -51,6 +53,21 @@ PALETTE = [
 
 
 # ========================= 法向聚类工具函数 =========================
+
+def seed_everything(seed: int = RANDOM_SEED):
+    """
+    固定 Python / NumPy / PyTorch 的随机性，尽量提高复现性。
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
 
 def kmeans_torch(x: torch.Tensor, num_clusters: int, num_iters: int = 10):
     """
@@ -67,7 +84,10 @@ def kmeans_torch(x: torch.Tensor, num_clusters: int, num_iters: int = 10):
     """
     device = x.device
     N, D = x.shape
-    indices = torch.randperm(N, device=device)[:num_clusters]
+    if N <= num_clusters:
+        indices = torch.arange(N, device=device)
+    else:
+        indices = torch.linspace(0, N - 1, steps=num_clusters, device=device).round().long()
     centers = x[indices].clone()
 
     labels = torch.zeros(N, dtype=torch.long, device=device)
@@ -610,7 +630,7 @@ def detect_planes_iterative(
     color_masks = SplitPic(
         normal_rgb,
         cluster,
-        merge_clusters=False,
+        merge_clusters=True,
     )
     color_masks_np = [m.cpu().numpy().astype(bool) for m in color_masks]
     normal_rgb_np = normal_rgb.cpu().numpy().clip(0, 255).astype(np.uint8)
@@ -734,48 +754,61 @@ def visualize_planes(
     image_np: np.ndarray,
     confirmed_planes: list,
     output_dir: Path,
+    image_stem: str,
+    debug: bool = False,
 ):
     h, w = image_np.shape[:2]
     output_dir.mkdir(parents=True, exist_ok=True)
 
     colored = np.zeros((h, w, 3), dtype=np.uint8)
-    overlay = image_np.copy().astype(np.float64)
-
-    individual_dir = output_dir / "planes_individual"
-    individual_dir.mkdir(exist_ok=True)
+    index_map = np.zeros((h, w), dtype=np.uint16)
+    overlay = image_np.copy().astype(np.float64) if debug else None
+    individual_dir = None
+    if debug:
+        individual_dir = output_dir / f"{image_stem}_planes_individual"
+        individual_dir.mkdir(exist_ok=True)
 
     planes_sorted = sorted(confirmed_planes, key=lambda p: p['area'], reverse=True)
 
     for i, plane in enumerate(planes_sorted):
         mask = plane['mask']
         color = PALETTE[i % len(PALETTE)]
+        index_map[mask] = i + 1
 
         for c in range(3):
             colored[:, :, c][mask] = color[c]
 
-        for c in range(3):
-            overlay[:, :, c][mask] = (
-                image_np[:, :, c][mask] * 0.55 + color[c] * 0.45
-            )
+        if debug:
+            for c in range(3):
+                overlay[:, :, c][mask] = (
+                    image_np[:, :, c][mask] * 0.55 + color[c] * 0.45
+                )
 
-        single = np.zeros((h, w, 3), dtype=np.uint8)
-        for c in range(3):
-            single[:, :, c][mask] = color[c]
-        single_path = individual_dir / f"plane_{i:03d}_{plane['round']}.png"
-        Image.fromarray(single).save(single_path)
+            single = np.zeros((h, w, 3), dtype=np.uint8)
+            for c in range(3):
+                single[:, :, c][mask] = color[c]
+            single_path = individual_dir / f"plane_{i:03d}_{plane['round']}.png"
+            Image.fromarray(single).save(single_path)
 
-    colored_path = output_dir / "planes_colored.png"
+    colored_path = output_dir / f"{image_stem}_vis.png"
     Image.fromarray(colored).save(colored_path)
 
-    overlay_path = output_dir / "planes_overlay.png"
-    Image.fromarray(overlay.astype(np.uint8)).save(overlay_path)
+    overlay_path = None
+    if debug:
+        overlay_path = output_dir / f"{image_stem}_overlay.png"
+        Image.fromarray(overlay.astype(np.uint8)).save(overlay_path)
 
-    return colored_path, overlay_path
+    index_path = output_dir / f"{image_stem}.npy"
+    np.save(index_path, index_map)
+
+    return colored_path, overlay_path, index_path
 
 
 # ========================= 主函数 =========================
 
 def main():
+    seed_everything(RANDOM_SEED)
+
     parser = argparse.ArgumentParser(
         description="Multi-Granularity Plane Detection via Dual-Center Cosine Distance"
     )
@@ -813,14 +846,19 @@ def main():
         help="模型输入缩放尺寸，默认 640",
     )
     parser.add_argument(
+        "--debug", action="store_true",
+        help="保存全部中间结果和调试可视化；默认只保存最终 npy 和 colored",
+    )
+    parser.add_argument(
         "--no-debug", action="store_true",
-        help="禁用每轮中间结果的 debug 可视化输出",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    debug_dir = None if args.no_debug else (output_dir / "debug")
+    debug_enabled = args.debug and not args.no_debug
+    debug_dir = output_dir / "debug" if debug_enabled else None
 
     print("=" * 70)
     print("  Plane Detection: Normal-Cluster Dominance Test")
@@ -853,6 +891,7 @@ def main():
 
     # ---- 加载图像 ----
     print(f"[INFO] 加载图像:   {args.image}")
+    image_path = Path(args.image)
     image = Image.open(args.image).convert('RGB')
     image_np = np.asarray(image)
     h, w = image_np.shape[:2]
@@ -876,7 +915,7 @@ def main():
     # ---- 迭代检测 ----
     print(f"\n[INFO] 开始多粒度平面检测")
     print(f"       area_threshold={args.area_threshold}, cluster={args.cluster}, min_pixels={args.min_pixels}")
-    if debug_dir:
+    if debug_enabled:
         print(f"       debug 输出: {debug_dir}")
 
     confirmed_planes = detect_planes_iterative(
@@ -891,7 +930,13 @@ def main():
     # ---- 可视化 ----
     print(f"\n{'─' * 70}")
     print(f"[INFO] 生成最终可视化...")
-    colored_path, overlay_path = visualize_planes(image_np, confirmed_planes, output_dir)
+    colored_path, overlay_path, index_path = visualize_planes(
+        image_np,
+        confirmed_planes,
+        output_dir,
+        image_stem=image_path.stem,
+        debug=debug_enabled,
+    )
 
     # ---- 统计报告 ----
     total_pixels = h * w
@@ -930,9 +975,10 @@ def main():
 
     print(f"\n  输出文件:")
     print(f"    纯色图:  {colored_path}")
-    print(f"    叠加图:  {overlay_path}")
-    print(f"    单独图:  {output_dir / 'planes_individual'}/")
-    if debug_dir:
+    print(f"    索引图:  {index_path}")
+    if debug_enabled and overlay_path is not None:
+        print(f"    叠加图:  {overlay_path}")
+        print(f"    单独图:  {output_dir / f'{image_path.stem}_planes_individual'}/")
         print(f"    Debug:   {debug_dir}/")
     print(f"\n{'=' * 70}\n")
 
