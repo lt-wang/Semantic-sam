@@ -5,17 +5,20 @@
 # --------------------------------------------------------
 
 import argparse
+import builtins
 import random
 import torch
 import numpy as np
 from PIL import Image
 from pathlib import Path
 import cv2
+from tqdm.auto import tqdm
 from torchvision import transforms
 
 from semantic_sam.BaseModel import BaseModel
 from semantic_sam import build_model
 from utils.arguments import load_opt_from_config_file
+from utils.sam_utils.amg import remove_small_regions
 from tasks.automatic_mask_generator import SemanticSamAutomaticMaskGenerator
 
 # ========================= 配置 =========================
@@ -42,6 +45,7 @@ NORMAL_MERGE_COLOR_THRESH = 50.0
 NORMAL_EDGE_CANNY_LOW = 50
 NORMAL_EDGE_CANNY_HIGH = 100
 NORMAL_EDGE_DILATE = 3
+FINAL_MASK_HOLE_AREA = 500
 MAX_PLANE_MEAN_ANGLE = 13.0
 MAX_PLANE_P95_ANGLE = 30.0
 RANDOM_SEED = 22
@@ -53,6 +57,25 @@ PALETTE = [
     (170, 110,  40), (255, 250, 200), (128,   0,   0), (170, 255, 195),
     (128, 128,   0), (255, 215, 180), (  0,   0, 128), (128, 128, 128),
 ]
+
+
+def log(message: str = "", quiet: bool = False):
+    if not quiet:
+        print(message)
+
+
+def apply_quiet_mode(quiet: bool):
+    if quiet:
+        builtins.print = lambda *args, **kwargs: None
+
+
+def progress(iterable, quiet: bool = False, **kwargs):
+    return tqdm(
+        iterable,
+        disable=not quiet,
+        dynamic_ncols=True,
+        **kwargs,
+    )
 
 
 # ========================= 法向聚类工具函数 =========================
@@ -201,6 +224,14 @@ def largest_connected_component(mask: np.ndarray, min_area: int = 1) -> np.ndarr
     if max_area < min_area:
         return None
     return (labels == max_idx)
+
+
+def fill_mask_holes(mask: np.ndarray, area_thresh: int = FINAL_MASK_HOLE_AREA) -> np.ndarray:
+    """
+    对最终平面 mask 做小孔洞填补，避免平面内部出现零碎空洞。
+    """
+    cleaned_mask, _ = remove_small_regions(mask.astype(bool), area_thresh, mode="holes")
+    return cleaned_mask.astype(bool)
 
 
 def normal_flatness(mask: np.ndarray, normal_tensor: torch.Tensor) -> dict:
@@ -441,6 +472,7 @@ def _save_debug_round(
     normal_rgb_np: np.ndarray, # (H, W, 3) uint8，法向映射到 [0,255] 的图
     normal_edge_np: np.ndarray,# (H, W) bool，normal_rgb 上的边缘
     debug_dir: Path,
+    quiet: bool = False,
 ):
     """
     保存单轮的全套 debug 图到 debug_dir/round_{idx}_{name}/
@@ -655,11 +687,14 @@ def _save_debug_round(
         cluster_fname = fname.replace('.png', '_on_clusters.png')
         Image.fromarray(cluster_u8).save(masks_dir / cluster_fname)
 
-    print(f"  [DEBUG] 已保存 round debug → {rdir.relative_to(debug_dir.parent)}")
-    print(f"          all_masks={len(all_masks)}, planar={planar_count}, "
-          f"rejected={rejected_count}, "
-          f"skipped={sum(1 for r in evaluated_records if r[2] == 'skipped')}")
-    print(f"          累计确认平面: {total_cumulative}")
+    log(f"  [DEBUG] 已保存 round debug → {rdir.relative_to(debug_dir.parent)}", quiet=quiet)
+    log(
+        f"          all_masks={len(all_masks)}, planar={planar_count}, "
+        f"rejected={rejected_count}, "
+        f"skipped={sum(1 for r in evaluated_records if r[2] == 'skipped')}",
+        quiet=quiet,
+    )
+    log(f"          累计确认平面: {total_cumulative}", quiet=quiet)
 
 
 # ========================= 迭代检测主逻辑 =========================
@@ -673,6 +708,7 @@ def detect_planes_iterative(
     min_pixels: int = MIN_PLANE_PIXELS,
     text_size: int = 640,
     debug_dir: Path = None,
+    quiet: bool = False,
 ) -> list:
     """
     三轮逐级递进平面检测。
@@ -711,20 +747,23 @@ def detect_planes_iterative(
     color_masks_np = [m.cpu().numpy().astype(bool) for m in color_masks]
     normal_rgb_np = normal_rgb.cpu().numpy().clip(0, 255).astype(np.uint8)
     normal_edge = compute_normal_edge_map(normal_map)
-    print(f"  normal_edge 像素数: {int(normal_edge.sum())}")
+    log(f"  normal_edge 像素数: {int(normal_edge.sum())}", quiet=quiet)
 
     for round_idx, round_cfg in enumerate(ROUNDS):
         round_name = round_cfg["name"]
         levels = round_cfg["levels"]
 
         remaining_ratio = remaining.sum() / total_pixels * 100
-        print(f"\n{'─' * 70}")
-        print(f"▶ Round {round_idx + 1}: {round_name}  |  levels={levels}")
-        print(f"  剩余未处理区域: {remaining_ratio:.1f}%")
-        print(f"  平面最小面积: {min_plane_area}px ({MIN_PLANE_AREA_RATIO * 100:.1f}%)")
+        log(f"\n{'─' * 70}", quiet=quiet)
+        log(f"▶ Round {round_idx + 1}: {round_name}  |  levels={levels}", quiet=quiet)
+        log(f"  剩余未处理区域: {remaining_ratio:.1f}%", quiet=quiet)
+        log(
+            f"  平面最小面积: {min_plane_area}px ({MIN_PLANE_AREA_RATIO * 100:.1f}%)",
+            quiet=quiet,
+        )
 
         if remaining.sum() < min_plane_area:
-            print(f"  剩余像素不足 {min_plane_area}，跳过")
+            log(f"  剩余像素不足 {min_plane_area}，跳过", quiet=quiet)
             continue
 
         remaining_before = remaining.copy()
@@ -732,11 +771,11 @@ def detect_planes_iterative(
         # 生成掩码
         with torch.no_grad(), torch.cuda.amp.autocast():
             masks = generate_masks_with_levels(model, image, levels, text_size)
-        print(f"  生成掩码数: {len(masks)}")
+        log(f"  生成掩码数: {len(masks)}", quiet=quiet)
 
         masks.sort(key=lambda x: x['area'], reverse=True)
 
-        print(f"  法向聚类数: {len(color_masks)}")
+        log(f"  法向聚类数: {len(color_masks)}", quiet=quiet)
 
         round_count = 0
         evaluated_records = []   # (effective_mask, ratio, status)
@@ -799,6 +838,11 @@ def detect_planes_iterative(
                 for piece in planar_pieces:
                     piece_mask = np.logical_and(piece['mask'], np.logical_not(normal_edge))
                     piece_mask = largest_connected_component(piece_mask, min_area=min_plane_area)
+                    if piece_mask is None:
+                        continue
+
+                    piece_mask = fill_mask_holes(piece_mask, area_thresh=FINAL_MASK_HOLE_AREA)
+                    piece_mask = largest_connected_component(piece_mask, min_area=min_plane_area)
                     if piece_mask is None or int(piece_mask.sum()) < min_plane_area:
                         continue
 
@@ -827,9 +871,12 @@ def detect_planes_iterative(
 
         n_rejected = sum(1 for r in evaluated_records if r[2] == 'rejected')
         n_skipped  = sum(1 for r in evaluated_records if r[2] == 'skipped')
-        print(f"  ✓ 本轮确认平面: {round_count}  |  "
-              f"丢弃: {n_rejected}  |  跳过: {n_skipped}")
-        print(f"  ✓ 累计确认平面: {len(confirmed_planes)} 个")
+        log(
+            f"  ✓ 本轮确认平面: {round_count}  |  "
+            f"丢弃: {n_rejected}  |  跳过: {n_skipped}",
+            quiet=quiet,
+        )
+        log(f"  ✓ 累计确认平面: {len(confirmed_planes)} 个", quiet=quiet)
 
         # ── 保存本轮 debug ────────────────────────────────────────────────
         if debug_dir is not None:
@@ -845,6 +892,7 @@ def detect_planes_iterative(
                 normal_rgb_np,
                 normal_edge,
                 debug_dir,
+                quiet=quiet,
             )
 
     return confirmed_planes
@@ -910,30 +958,31 @@ def visualize_planes(
 
 # ========================= 主函数 =========================
 
-def load_normal_map(normal_path: Path) -> np.ndarray:
-    print(f"\n[INFO] 加载法线图: {normal_path}")
+def load_normal_map(normal_path: Path, quiet: bool = False) -> np.ndarray:
+    log(f"\n[INFO] 加载法线图: {normal_path}", quiet=quiet)
     normal_ext = normal_path.suffix.lower()
     if normal_ext == '.npy':
         normal_map = np.load(normal_path).astype(np.float32)
-        print(f"       格式: .npy  shape={normal_map.shape}")
+        log(f"       格式: .npy  shape={normal_map.shape}", quiet=quiet)
     else:
         vis_img = np.asarray(Image.open(normal_path).convert('RGB')).astype(np.float32)
         normal_map = vis_img / 255.0 * 2.0 - 1.0
         norms = np.linalg.norm(normal_map, axis=-1, keepdims=True)
         norms = np.where(norms < 1e-6, 1.0, norms)
         normal_map = (normal_map / norms).astype(np.float32)
-        print(f"       格式: 可视化图像  shape={normal_map.shape}")
-        print(f"       已从 pixel 反推并重归一化")
+        log(f"       格式: 可视化图像  shape={normal_map.shape}", quiet=quiet)
+        log(f"       已从 pixel 反推并重归一化", quiet=quiet)
         sample_norms = np.linalg.norm(normal_map.reshape(-1, 3), axis=1)
-        print(
+        log(
             f"       模长检查: min={sample_norms.min():.4f}, "
-            f"max={sample_norms.max():.4f}, mean={sample_norms.mean():.4f}"
+            f"max={sample_norms.max():.4f}, mean={sample_norms.mean():.4f}",
+            quiet=quiet,
         )
-    print(f"       shape={normal_map.shape}, dtype={normal_map.dtype}")
+    log(f"       shape={normal_map.shape}, dtype={normal_map.dtype}", quiet=quiet)
     return normal_map
 
 
-def collect_input_pairs(image_input: Path, normal_input: Path) -> list:
+def collect_input_pairs(image_input: Path, normal_input: Path, quiet: bool = False) -> list:
     image_suffixes = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
     normal_suffix_priority = ['.npy', '.png', '.jpg', '.jpeg', '.bmp', '.webp']
 
@@ -970,9 +1019,15 @@ def collect_input_pairs(image_input: Path, normal_input: Path) -> list:
     missing_images = sorted(set(normal_files) - set(image_files))
 
     if missing_normals:
-        print(f"[WARN] 以下 image 没有匹配到 normal，已跳过: {missing_normals[:10]}")
+        log(
+            f"[WARN] 以下 image 没有匹配到 normal，已跳过: {missing_normals[:10]}",
+            quiet=quiet,
+        )
     if missing_images:
-        print(f"[WARN] 以下 normal 没有匹配到 image，已跳过: {missing_images[:10]}")
+        log(
+            f"[WARN] 以下 normal 没有匹配到 image，已跳过: {missing_images[:10]}",
+            quiet=quiet,
+        )
     if not common_stems:
         raise ValueError("输入文件夹中没有找到同 stem 的 image/normal 配对。")
 
@@ -990,14 +1045,15 @@ def process_single_image(
     min_pixels: int,
     text_size: int,
     debug_enabled: bool,
+    quiet: bool,
 ):
-    normal_map = load_normal_map(normal_path)
+    normal_map = load_normal_map(normal_path, quiet=quiet)
 
-    print(f"[INFO] 加载图像:   {image_path}")
+    log(f"[INFO] 加载图像:   {image_path}", quiet=quiet)
     image = Image.open(image_path).convert('RGB')
     image_np = np.asarray(image)
     h, w = image_np.shape[:2]
-    print(f"       尺寸: {w} x {h}")
+    log(f"       尺寸: {w} x {h}", quiet=quiet)
 
     assert normal_map.shape[0] == h and normal_map.shape[1] == w, (
         f"法线图尺寸 {normal_map.shape[:2]} 与图像尺寸 ({h}, {w}) 不匹配！"
@@ -1005,10 +1061,13 @@ def process_single_image(
 
     debug_dir = vis_output_dir / f"{image_path.stem}_debug" if debug_enabled else None
 
-    print(f"\n[INFO] 开始多粒度平面检测")
-    print(f"       area_threshold={area_threshold}, cluster={cluster}, min_pixels={min_pixels}")
+    log(f"\n[INFO] 开始多粒度平面检测", quiet=quiet)
+    log(
+        f"       area_threshold={area_threshold}, cluster={cluster}, min_pixels={min_pixels}",
+        quiet=quiet,
+    )
     if debug_enabled:
-        print(f"       debug 输出: {debug_dir}")
+        log(f"       debug 输出: {debug_dir}", quiet=quiet)
 
     confirmed_planes = detect_planes_iterative(
         model,
@@ -1019,10 +1078,11 @@ def process_single_image(
         min_pixels=min_pixels,
         text_size=text_size,
         debug_dir=debug_dir,
+        quiet=quiet,
     )
 
-    print(f"\n{'─' * 70}")
-    print(f"[INFO] 生成最终可视化...")
+    log(f"\n{'─' * 70}", quiet=quiet)
+    log(f"[INFO] 生成最终可视化...", quiet=quiet)
     colored_path, overlay_path, index_path = visualize_planes(
         image_np,
         confirmed_planes,
@@ -1131,7 +1191,12 @@ def main():
         "--no-debug", action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="静默模式：屏蔽全部 print 输出，仅显示 tqdm 进度条",
+    )
     args = parser.parse_args()
+    apply_quiet_mode(args.quiet)
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1143,12 +1208,12 @@ def main():
     image_input = Path(args.image)
     normal_input = Path(args.normal)
 
-    print("=" * 70)
-    print("  Plane Detection: Normal-Cluster Dominance Test")
-    print("=" * 70)
+    log("=" * 70, quiet=args.quiet)
+    log("  Plane Detection: Normal-Cluster Dominance Test", quiet=args.quiet)
+    log("=" * 70, quiet=args.quiet)
 
     # ---- 加载模型 ----
-    print(f"\n[INFO] 加载 Semantic-SAM 模型...")
+    log(f"\n[INFO] 加载 Semantic-SAM 模型...", quiet=args.quiet)
     opt = load_opt_from_config_file(CFG_PATH)
     model = (
         BaseModel(opt, build_model(opt))
@@ -1156,20 +1221,27 @@ def main():
         .eval()
         .cuda()
     )
-    print(f"       ✓ 模型就绪")
+    log(f"       ✓ 模型就绪", quiet=args.quiet)
 
-    input_pairs = collect_input_pairs(image_input, normal_input)
+    input_pairs = collect_input_pairs(image_input, normal_input, quiet=args.quiet)
     if image_input.is_dir():
-        print(f"\n[INFO] 批量处理模式")
-        print(f"       image dir:  {image_input}")
-        print(f"       normal dir: {normal_input}")
-        print(f"       配对数量:    {len(input_pairs)}")
+        log(f"\n[INFO] 批量处理模式", quiet=args.quiet)
+        log(f"       image dir:  {image_input}", quiet=args.quiet)
+        log(f"       normal dir: {normal_input}", quiet=args.quiet)
+        log(f"       配对数量:    {len(input_pairs)}", quiet=args.quiet)
 
     results = []
-    for idx, (image_path, normal_path) in enumerate(input_pairs, start=1):
-        print(f"\n{'#' * 70}")
-        print(f"[INFO] ({idx}/{len(input_pairs)}) 处理 {image_path.stem}")
-        print(f"{'#' * 70}")
+    input_iter = progress(
+        enumerate(input_pairs, start=1),
+        total=len(input_pairs),
+        quiet=args.quiet,
+        desc="Images",
+    )
+    for idx, (image_path, normal_path) in input_iter:
+        input_iter.set_postfix(image=image_path.stem)
+        log(f"\n{'#' * 70}", quiet=args.quiet)
+        log(f"[INFO] ({idx}/{len(input_pairs)}) 处理 {image_path.stem}", quiet=args.quiet)
+        log(f"{'#' * 70}", quiet=args.quiet)
         result = process_single_image(
             model,
             image_path,
@@ -1181,6 +1253,7 @@ def main():
             min_pixels=args.min_pixels,
             text_size=args.text_size,
             debug_enabled=debug_enabled,
+            quiet=args.quiet,
         )
         results.append(result)
 
