@@ -15,10 +15,13 @@ import cv2
 from tqdm.auto import tqdm
 from torchvision import transforms
 
+# from semantic_sam.BaseModel import BaseModel
+# from semantic_sam.BaseModel import BaseModel
 from semantic_sam.BaseModel import BaseModel
 from semantic_sam import build_model
 from utils.arguments import load_opt_from_config_file
 from utils.sam_utils.amg import remove_small_regions
+from tasks import automatic_mask_generator as sam_amg
 from tasks.automatic_mask_generator import SemanticSamAutomaticMaskGenerator
 
 # ========================= 配置 =========================
@@ -35,7 +38,7 @@ CFG_PATH = "configs/semantic_sam_only_sa-1b_swinL.yaml"
 ROUNDS = [
     {"name": "semantic", "levels": [2]},
     {"name": "instance", "levels": [3]},
-    {"name": "part",     "levels": [6]},
+    {"name": "part",     "levels": [4,5,6]},
 ]
 AREA_THRESHOLD = 0.7
 CLUSTER = 5
@@ -228,7 +231,7 @@ def largest_connected_component(mask: np.ndarray, min_area: int = 1) -> np.ndarr
 
 def fill_mask_holes(mask: np.ndarray, area_thresh: int = FINAL_MASK_HOLE_AREA) -> np.ndarray:
     """
-    对最终平面 mask 做小孔洞填补，避免平面内部出现零碎空洞。
+    对最终平面 mask 做小孔洞填补，避免 normal_edge 噪声带来的零碎空洞。
     """
     cleaned_mask, _ = remove_small_regions(mask.astype(bool), area_thresh, mode="holes")
     return cleaned_mask.astype(bool)
@@ -426,9 +429,249 @@ def extract_planar_submasks(
 
 # ========================= 掩码生成 =========================
 
+class FocusedSemanticSamAutomaticMaskGenerator(SemanticSamAutomaticMaskGenerator):
+    """
+    在不改动原始 Semantic-SAM 代码的前提下，支持用 focus_mask 约束采样点。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_focus_stats = self._make_focus_stats(enabled=False)
+
+    @staticmethod
+    def _make_focus_stats(enabled: bool) -> dict:
+        return {
+            "enabled": enabled,
+            "total_points": 0,
+            "kept_points": 0,
+            "fallback_to_full_image": False,
+        }
+
+    @staticmethod
+    def _empty_mask_data(device: torch.device) -> sam_amg.MaskData:
+        return sam_amg.MaskData(
+            rles=[],
+            boxes=torch.empty((0, 4), dtype=torch.float32, device=device),
+            iou_preds=torch.empty((0,), dtype=torch.float32, device=device),
+            points=torch.empty((0, 4), dtype=torch.float32, device=device),
+            stability_score=torch.empty((0,), dtype=torch.float32, device=device),
+        )
+
+    @staticmethod
+    def _normalize_focus_mask(
+        focus_mask: np.ndarray | torch.Tensor | None,
+        expected_hw: tuple[int, int],
+    ) -> np.ndarray | None:
+        if focus_mask is None:
+            return None
+        if isinstance(focus_mask, torch.Tensor):
+            focus_mask = focus_mask.detach().cpu().numpy()
+        focus_mask = np.asarray(focus_mask)
+        if focus_mask.ndim != 2:
+            raise ValueError(f"focus_mask 必须是 2D，实际 shape={focus_mask.shape}")
+        if tuple(focus_mask.shape) != tuple(expected_hw):
+            raise ValueError(
+                f"focus_mask 尺寸 {focus_mask.shape} 与输入图像尺寸 {expected_hw} 不一致"
+            )
+        return focus_mask.astype(bool, copy=False)
+
+    @staticmethod
+    def _resample_points_in_focus_mask(
+        points_for_image: np.ndarray,
+        crop_box: list[int],
+        cropped_im_size: tuple[int, ...],
+        focus_mask: np.ndarray | None,
+        focus_stats: dict,
+    ) -> np.ndarray:
+        target_points = int(len(points_for_image))
+        focus_stats["total_points"] += target_points
+        if target_points == 0:
+            return points_for_image
+
+        if focus_mask is None:
+            focus_stats["kept_points"] += target_points
+            return points_for_image
+
+        crop_h, crop_w = cropped_im_size
+        x0, y0, _, _ = crop_box
+        crop_focus = focus_mask[y0 : y0 + crop_h, x0 : x0 + crop_w]
+        ys, xs = np.nonzero(crop_focus)
+        available_points = int(len(xs))
+        focus_stats["focus_pixels"] = focus_stats.get("focus_pixels", 0) + available_points
+        if available_points == 0:
+            return np.empty((0, 2), dtype=np.float32)
+
+        replace = available_points < target_points
+        sampled_idx = np.random.choice(
+            available_points,
+            size=target_points,
+            replace=replace,
+        )
+        sampled_x = (xs[sampled_idx].astype(np.float32) + 0.5) / max(crop_w, 1)
+        sampled_y = (ys[sampled_idx].astype(np.float32) + 0.5) / max(crop_h, 1)
+        resampled_points = np.stack([sampled_x, sampled_y], axis=1).astype(np.float32)
+        focus_stats["kept_points"] += int(len(resampled_points))
+        focus_stats["resampled_with_replacement"] = (
+            focus_stats.get("resampled_with_replacement", False) or replace
+        )
+        return resampled_points
+
+    @torch.no_grad()
+    def generate(
+        self,
+        image: np.ndarray,
+        focus_mask: np.ndarray | torch.Tensor | None = None,
+    ) -> list[dict]:
+        focus_mask = self._normalize_focus_mask(focus_mask, image.shape[-2:])
+        focus_stats = self._make_focus_stats(enabled=focus_mask is not None)
+        mask_data = self._generate_masks(image, focus_mask=focus_mask, focus_stats=focus_stats)
+
+        if (
+            focus_mask is not None
+            and focus_stats["total_points"] > 0
+            and focus_stats["kept_points"] == 0
+        ):
+            focus_stats["fallback_to_full_image"] = True
+            fallback_stats = self._make_focus_stats(enabled=False)
+            mask_data = self._generate_masks(image, focus_mask=None, focus_stats=fallback_stats)
+            focus_stats["fallback_total_points"] = fallback_stats["total_points"]
+            focus_stats["fallback_kept_points"] = fallback_stats["kept_points"]
+
+        self.last_focus_stats = focus_stats
+
+        if self.min_mask_region_area > 0:
+            mask_data = self.postprocess_small_regions(
+                mask_data,
+                self.min_mask_region_area,
+                max(self.box_nms_thresh, self.crop_nms_thresh),
+            )
+
+        if self.output_mode == "coco_rle":
+            mask_data["segmentations"] = [
+                sam_amg.coco_encode_rle(rle) for rle in mask_data["rles"]
+            ]
+        elif self.output_mode == "binary_mask":
+            mask_data["segmentations"] = [
+                sam_amg.rle_to_mask(rle) for rle in mask_data["rles"]
+            ]
+        else:
+            mask_data["segmentations"] = mask_data["rles"]
+
+        curr_anns = []
+        for idx in range(len(mask_data["segmentations"])):
+            ann = {
+                "segmentation": mask_data["segmentations"][idx],
+                "area": sam_amg.area_from_rle(mask_data["rles"][idx]),
+                "bbox": sam_amg.box_xyxy_to_xywh(mask_data["boxes"][idx]).tolist(),
+                "predicted_iou": mask_data["iou_preds"][idx].item(),
+                "point_coords": [mask_data["points"][idx].tolist()],
+                "stability_score": mask_data["stability_score"][idx].item(),
+                "crop_box": sam_amg.box_xyxy_to_xywh(mask_data["crop_boxes"][idx]).tolist(),
+            }
+            curr_anns.append(ann)
+
+        return curr_anns
+
+    def _generate_masks(
+        self,
+        image: np.ndarray,
+        focus_mask: np.ndarray | None = None,
+        focus_stats: dict | None = None,
+    ) -> sam_amg.MaskData:
+        orig_size = image.shape[-2:]
+        crop_boxes, layer_idxs = sam_amg.generate_crop_boxes(
+            orig_size, self.crop_n_layers, self.crop_overlap_ratio
+        )
+        device = image.device if isinstance(image, torch.Tensor) else torch.device("cpu")
+        data = self._empty_mask_data(device)
+
+        for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
+            crop_data = self._process_crop(
+                image,
+                crop_box,
+                layer_idx,
+                orig_size,
+                focus_mask=focus_mask,
+                focus_stats=focus_stats,
+            )
+            data.cat(crop_data)
+
+        if len(crop_boxes) > 1 and len(data["boxes"]) > 0:
+            scores = 1 / sam_amg.box_area(data["crop_boxes"])
+            scores = scores.to(data["boxes"].device)
+            keep_by_nms = sam_amg.batched_nms(
+                data["boxes"].float(),
+                scores,
+                torch.zeros(len(data["boxes"]), device=data["boxes"].device),
+                iou_threshold=self.crop_nms_thresh,
+            )
+            data.filter(keep_by_nms)
+
+        data.to_numpy()
+        return data
+
+    def _process_crop(
+        self,
+        image: np.ndarray,
+        crop_box: list[int],
+        crop_layer_idx: int,
+        orig_size: tuple[int, ...],
+        focus_mask: np.ndarray | None = None,
+        focus_stats: dict | None = None,
+    ) -> sam_amg.MaskData:
+        x0, y0, x1, y1 = crop_box
+        cropped_im = image
+        cropped_im_size = cropped_im.shape[-2:]
+        device = image.device if isinstance(image, torch.Tensor) else torch.device("cpu")
+
+        if focus_stats is None:
+            focus_stats = self._make_focus_stats(enabled=focus_mask is not None)
+
+        points_for_image = self.point_grids[crop_layer_idx]
+        points_for_image = self._resample_points_in_focus_mask(
+            points_for_image,
+            crop_box,
+            cropped_im_size,
+            focus_mask,
+            focus_stats,
+        )
+
+        if len(points_for_image) == 0:
+            return self._empty_mask_data(device)
+
+        data = self._empty_mask_data(device)
+        self.enc_features = None
+        for (points,) in sam_amg.batch_iterator(self.points_per_batch, points_for_image):
+            batch_data = self._process_batch(cropped_im, points, cropped_im_size, crop_box, orig_size)
+            data.cat(batch_data)
+            del batch_data
+
+        if len(data["boxes"]) > 0:
+            keep_by_nms = sam_amg.batched_nms(
+                data["boxes"].float(),
+                data["iou_preds"],
+                torch.zeros(len(data["boxes"]), device=data["boxes"].device),
+                iou_threshold=self.box_nms_thresh,
+            )
+            data.filter(keep_by_nms)
+
+        data["boxes"] = sam_amg.uncrop_boxes_xyxy(data["boxes"], crop_box)
+        data["crop_boxes"] = torch.tensor(
+            [crop_box for _ in range(len(data["rles"]))],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        return data
+
+
 def generate_masks_with_levels(
-    model, image: Image.Image, levels: list, text_size: int = 640
-) -> list:
+    model,
+    image: Image.Image,
+    levels: list,
+    text_size: int = 640,
+    focus_mask: np.ndarray | None = None,
+) -> tuple[list, dict]:
     orig_w, orig_h = image.size
     t = [transforms.Resize(int(text_size), interpolation=Image.BICUBIC)]
     transform = transforms.Compose(t)
@@ -436,7 +679,15 @@ def generate_masks_with_levels(
     image_np = np.asarray(image_transformed)
     image_tensor = torch.from_numpy(image_np.copy()).permute(2, 0, 1).cuda()
 
-    mask_generator = SemanticSamAutomaticMaskGenerator(
+    focus_mask_resized = None
+    if focus_mask is not None:
+        focus_mask_resized = cv2.resize(
+            focus_mask.astype(np.uint8),
+            (image_np.shape[1], image_np.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+
+    mask_generator = FocusedSemanticSamAutomaticMaskGenerator(
         model,
         points_per_side=32,
         pred_iou_thresh=0.88,
@@ -444,7 +695,8 @@ def generate_masks_with_levels(
         min_mask_region_area=10,
         level=levels,
     )
-    outputs = mask_generator.generate(image_tensor)
+    outputs = mask_generator.generate(image_tensor, focus_mask=focus_mask_resized)
+    focus_stats = dict(mask_generator.last_focus_stats)
 
     for mask_dict in outputs:
         seg = mask_dict['segmentation']
@@ -453,7 +705,7 @@ def generate_masks_with_levels(
             interpolation=cv2.INTER_NEAREST,
         )
         mask_dict['segmentation'] = resized.astype(bool)
-    return outputs
+    return outputs, focus_stats
 
 
 # ========================= Debug 可视化 =========================
@@ -484,11 +736,14 @@ def _save_debug_round(
         04_rejected_overlay.png  — 本轮丢弃 mask（红色）叠加原图
         05_remaining_after.png   — 本轮结束后剩余区域
         06_summary_grid.png      — 上述 5 张并排总览
-        07_{round_name}_planar.png — 累计已确认平面（含之前所有轮次）
+        07_{round_name}_planar.png — 本轮确认平面的纯彩色可视化
         08_cluster_map.png         — 本轮法向聚类区域可视化
+        ../cluster_map.png         — debug 根目录共享的一份 cluster_map
         09_normal_edge.png         — 本轮 normal_rgb 的边缘图
+        ../normal_edge.png         — debug 根目录共享的一份 normal_edge
         all_masks/                 — 本轮生成器输出的所有原始 mask
             mask_{j:03d}.png
+        02b_all_masks_vis.png      — 所有原始 mask 的彩色汇总可视化
         evaluated/
             mask_{j:03d}_ratio{:.3f}_{PLANAR|REJECTED|SKIPPED}.png
     """
@@ -497,16 +752,27 @@ def _save_debug_round(
     rdir.mkdir(parents=True, exist_ok=True)
     masks_dir = rdir / "evaluated"
     masks_dir.mkdir(exist_ok=True)
+    font = cv2.FONT_HERSHEY_SIMPLEX
 
     # ── 保存所有原始 mask ──────────────────────────────────────────────
     all_masks_dir = rdir / "all_masks"
     all_masks_dir.mkdir(exist_ok=True)
+    stale_all_masks_vis_dir = rdir / "all_masks_visualized"
+    if stale_all_masks_vis_dir.exists():
+        for stale_path in stale_all_masks_vis_dir.iterdir():
+            if stale_path.is_file():
+                stale_path.unlink()
+        stale_all_masks_vis_dir.rmdir()
+
+    all_masks_vis = np.zeros((h, w, 3), dtype=np.uint8)
     for j, md in enumerate(all_masks):
         seg = md['segmentation']
         mask_img = (seg.astype(np.uint8) * 255)
         Image.fromarray(mask_img, mode='L').save(all_masks_dir / f"mask_{j:03d}.png")
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
+        color = PALETTE[j % len(PALETTE)]
+        for c in range(3):
+            all_masks_vis[:, :, c][seg] = color[c]
+    Image.fromarray(all_masks_vis).save(rdir / "02b_all_masks_vis.png")
 
     # ── 01 remaining before ──────────────────────────────────────────────
     rem_before_img = (remaining_before.astype(np.uint8) * 255)
@@ -590,24 +856,18 @@ def _save_debug_round(
     grid = np.concatenate(resized_panels, axis=1)
     Image.fromarray(grid).save(rdir / "06_summary_grid.png")
 
-    # ── 07 累计已确认平面（含之前所有轮次） ─────────────────────────────
-    overlay_cumulative = image_np.copy().astype(np.float64)
-    for i, plane in enumerate(cumulative_planes):
-        mask = plane['mask']
+    # ── 07 本轮确认平面纯可视化 ────────────────────────────────────────
+    round_planar_vis = np.zeros((h, w, 3), dtype=np.uint8)
+    round_planar_masks = [
+        eff_mask for (eff_mask, _ratio, status, _ra) in evaluated_records
+        if status == 'planar'
+    ]
+    for i, mask in enumerate(round_planar_masks):
         color = PALETTE[i % len(PALETTE)]
         for c in range(3):
-            overlay_cumulative[:, :, c][mask] = (
-                image_np[:, :, c][mask] * 0.45 + color[c] * 0.55
-            )
-    img_cumulative = overlay_cumulative.astype(np.uint8)
-    total_cumulative = len(cumulative_planes)
-    cv2.putText(img_cumulative, f"{round_name}_planar: {total_cumulative} planes (cumulative)",
-                (6, 24), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(img_cumulative, f"{round_name}_planar: {total_cumulative} planes (cumulative)",
-                (6, 24), font, 0.7, (0, 200, 255), 1, cv2.LINE_AA)
-    Image.fromarray(img_cumulative).save(rdir / f"07_{round_name}_planar.png")
-    # 同时保存一份到 debug 根目录，方便查看
-    Image.fromarray(img_cumulative).save(debug_dir / f"{round_name}_planar.png")
+            round_planar_vis[:, :, c][mask] = color[c]
+    Image.fromarray(round_planar_vis).save(rdir / f"07_{round_name}_planar.png")
+    Image.fromarray(round_planar_vis).save(debug_dir / f"{round_name}_planar.png")
 
     # ── 08 法向聚类区域可视化 ──────────────────────────────────────
     cluster_map_img = np.zeros((h, w, 3), dtype=np.uint8)
@@ -625,12 +885,32 @@ def _save_debug_round(
     cv2.putText(cluster_map_blend, f"clusters: {len(color_masks_np)}",
                 (6, 24), font, 0.7, (255, 255, 0), 1, cv2.LINE_AA)
     Image.fromarray(cluster_map_blend).save(rdir / "08_cluster_map.png")
-    Image.fromarray(cluster_map_blend).save(debug_dir / f"{round_name}_cluster_map.png")
+    root_cluster_map = debug_dir / "cluster_map.png"
+    if not root_cluster_map.exists():
+        Image.fromarray(cluster_map_blend).save(root_cluster_map)
+    for stale_name in (
+        "semantic_cluster_map.png",
+        "instance_cluster_map.png",
+        "part_cluster_map.png",
+    ):
+        stale_path = debug_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
 
     # ── 09 normal edge 可视化 ─────────────────────────────────────────
     normal_edge_img = (normal_edge_np.astype(np.uint8) * 255)
     Image.fromarray(normal_edge_img, mode='L').save(rdir / "09_normal_edge.png")
-    Image.fromarray(normal_edge_img, mode='L').save(debug_dir / f"{round_name}_normal_edge.png")
+    root_normal_edge = debug_dir / "normal_edge.png"
+    if not root_normal_edge.exists():
+        Image.fromarray(normal_edge_img, mode='L').save(root_normal_edge)
+    for stale_name in (
+        "semantic_normal_edge.png",
+        "instance_normal_edge.png",
+        "part_normal_edge.png",
+    ):
+        stale_path = debug_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
 
     # ── per-mask evaluated images ──────────────────────────────────────────
     for j, (eff_mask, ratio, status, raw_areas) in enumerate(evaluated_records):
@@ -694,7 +974,7 @@ def _save_debug_round(
         f"skipped={sum(1 for r in evaluated_records if r[2] == 'skipped')}",
         quiet=quiet,
     )
-    log(f"          累计确认平面: {total_cumulative}", quiet=quiet)
+    log(f"          累计确认平面: {len(cumulative_planes)}", quiet=quiet)
 
 
 # ========================= 迭代检测主逻辑 =========================
@@ -767,11 +1047,34 @@ def detect_planes_iterative(
             continue
 
         remaining_before = remaining.copy()
+        round_focus_mask = None if round_idx == 0 else remaining_before
 
         # 生成掩码
         with torch.no_grad(), torch.cuda.amp.autocast():
-            masks = generate_masks_with_levels(model, image, levels, text_size)
+            masks, focus_stats = generate_masks_with_levels(
+                model,
+                image,
+                levels,
+                text_size,
+                focus_mask=round_focus_mask,
+            )
         log(f"  生成掩码数: {len(masks)}", quiet=quiet)
+        focus_mode = "full-image" if round_focus_mask is None else "remaining-focus"
+        focus_extra = ""
+        if round_focus_mask is not None:
+            focus_extra = f"  |  focus_pixels={focus_stats.get('focus_pixels', 0)}"
+            if focus_stats.get("resampled_with_replacement", False):
+                focus_extra += "  |  resample=with-replacement"
+        log(
+            f"  采样点保留: {focus_stats.get('kept_points', 0)} / "
+            f"{focus_stats.get('total_points', 0)}  |  {focus_mode}{focus_extra}",
+            quiet=quiet,
+        )
+        if focus_stats.get("fallback_to_full_image", False):
+            log(
+                "  [WARN] remaining focus 过滤掉全部采样点，已回退到全图采样",
+                quiet=quiet,
+            )
 
         masks.sort(key=lambda x: x['area'], reverse=True)
 
