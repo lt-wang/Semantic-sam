@@ -719,6 +719,7 @@ def _save_debug_round(
     all_masks: list,
     evaluated_records: list,   # list of (effective_mask, ratio, status)
                                # status: 'planar' | 'rejected' | 'skipped'
+    round_stats: dict,         # 本轮统计（mask 口径 + plane 口径）
     cumulative_planes: list,   # ALL confirmed planes so far (across all rounds)
     color_masks_np: list,      # list of (H, W) bool np.ndarray，法向聚类区域
     normal_rgb_np: np.ndarray, # (H, W, 3) uint8，法向映射到 [0,255] 的图
@@ -732,6 +733,8 @@ def _save_debug_round(
     输出文件：
         01_remaining_before.png  — 本轮开始前剩余区域（白=未处理，黑=已处理）
         02_all_masks_overlay.png — 本轮所有候选 mask（不同颜色）叠加原图
+        02b_all_masks_vis.png    — 所有原始 mask 的彩色汇总可视化
+        02c_all_masks_vis.png    — 仅保留上一轮剩余区域内的原始 mask 彩色汇总
         03_planar_overlay.png    — 本轮确认平面（绿色）叠加原图
         04_rejected_overlay.png  — 本轮丢弃 mask（红色）叠加原图
         05_remaining_after.png   — 本轮结束后剩余区域
@@ -743,7 +746,6 @@ def _save_debug_round(
         ../normal_edge.png         — debug 根目录共享的一份 normal_edge
         all_masks/                 — 本轮生成器输出的所有原始 mask
             mask_{j:03d}.png
-        02b_all_masks_vis.png      — 所有原始 mask 的彩色汇总可视化
         evaluated/
             mask_{j:03d}_ratio{:.3f}_{PLANAR|REJECTED|SKIPPED}.png
     """
@@ -773,6 +775,8 @@ def _save_debug_round(
         for c in range(3):
             all_masks_vis[:, :, c][seg] = color[c]
     Image.fromarray(all_masks_vis).save(rdir / "02b_all_masks_vis.png")
+    all_masks_vis_remaining = all_masks_vis * remaining_before[:, :, None].astype(np.uint8)
+    Image.fromarray(all_masks_vis_remaining).save(rdir / "02c_all_masks_vis.png")
 
     # ── 01 remaining before ──────────────────────────────────────────────
     rem_before_img = (remaining_before.astype(np.uint8) * 255)
@@ -968,12 +972,36 @@ def _save_debug_round(
         Image.fromarray(cluster_u8).save(masks_dir / cluster_fname)
 
     log(f"  [DEBUG] 已保存 round debug → {rdir.relative_to(debug_dir.parent)}", quiet=quiet)
-    log(
-        f"          all_masks={len(all_masks)}, planar={planar_count}, "
-        f"rejected={rejected_count}, "
-        f"skipped={sum(1 for r in evaluated_records if r[2] == 'skipped')}",
-        quiet=quiet,
+    accepted_masks = int(round_stats.get("accepted_masks", planar_count))
+    overlap_discarded = int(round_stats.get("overlap_discarded_masks", 0))
+    rejected_masks = int(round_stats.get("rejected_masks", rejected_count))
+    skipped_masks = int(
+        round_stats.get("skipped_masks", sum(1 for r in evaluated_records if r[2] == 'skipped'))
     )
+    empty_masks = int(round_stats.get("empty_masks", 0))
+    plane_count = int(round_stats.get("planes", planar_count))
+    accounted_masks = (
+        accepted_masks
+        + overlap_discarded
+        + rejected_masks
+        + skipped_masks
+        + empty_masks
+    )
+    debug_summary = (
+        f"          all_masks={len(all_masks)}, accepted_masks={accepted_masks}, "
+        f"overlap_discarded={overlap_discarded}, rejected={rejected_masks}, "
+        f"skipped={skipped_masks}, planes={plane_count}"
+    )
+    if empty_masks > 0:
+        debug_summary += f", empty={empty_masks}"
+    debug_summary += f", accounted={accounted_masks}"
+    log(debug_summary, quiet=quiet)
+    if accounted_masks != len(all_masks):
+        log(
+            f"          [WARN] 统计未对齐: accounted={accounted_masks}, "
+            f"all_masks={len(all_masks)}",
+            quiet=quiet,
+        )
     log(f"          累计确认平面: {len(cumulative_planes)}", quiet=quiet)
 
 
@@ -1080,7 +1108,14 @@ def detect_planes_iterative(
 
         log(f"  法向聚类数: {len(color_masks)}", quiet=quiet)
 
-        round_count = 0
+        round_stats = {
+            "accepted_masks": 0,
+            "overlap_discarded_masks": 0,
+            "rejected_masks": 0,
+            "skipped_masks": 0,
+            "empty_masks": 0,
+            "planes": 0,
+        }
         evaluated_records = []   # (effective_mask, ratio, status)
 
         for mask_dict in masks:
@@ -1088,6 +1123,7 @@ def detect_planes_iterative(
 
             mask_area = int(seg.sum())
             if mask_area == 0:
+                round_stats["empty_masks"] += 1
                 continue
 
             # 严格去重：只要 mask 有任意像素与已确认平面重叠，整个 mask 丢弃。
@@ -1095,12 +1131,14 @@ def detect_planes_iterative(
             # 会引入假阳性。已确认像素 = ~remaining。
             overlap_pixels = int((seg & ~remaining).sum())
             if overlap_pixels > 50:  # 允许少量重叠（边界像素等），但超过 50 像素就丢弃整个 mask
+                round_stats["overlap_discarded_masks"] += 1
                 continue
 
             # mask 完全位于未处理区域，直接使用原始 seg
             effective_mask = seg
 
             if effective_mask.sum() < min_plane_area:
+                round_stats["skipped_masks"] += 1
                 evaluated_records.append((effective_mask, 0.0, 'skipped', []))
                 continue
 
@@ -1158,7 +1196,7 @@ def detect_planes_iterative(
                         'p95_angle': float(piece['p95_angle']),
                     })
                     remaining[piece_mask] = False
-                    round_count += 1
+                    round_stats["planes"] += 1
                     accepted += 1
                     evaluated_records.append((
                         piece_mask,
@@ -1168,18 +1206,39 @@ def detect_planes_iterative(
                     ))
 
             if accepted > 0:
+                round_stats["accepted_masks"] += 1
                 continue
 
+            round_stats["rejected_masks"] += 1
             evaluated_records.append((effective_mask, best_ratio, 'rejected', best_raw_areas))
 
-        n_rejected = sum(1 for r in evaluated_records if r[2] == 'rejected')
-        n_skipped  = sum(1 for r in evaluated_records if r[2] == 'skipped')
+        accepted_masks = round_stats["accepted_masks"]
+        overlap_discarded = round_stats["overlap_discarded_masks"]
+        n_rejected = round_stats["rejected_masks"]
+        n_skipped = round_stats["skipped_masks"]
+        n_empty = round_stats["empty_masks"]
+        round_count = round_stats["planes"]
+        accounted_masks = accepted_masks + overlap_discarded + n_rejected + n_skipped + n_empty
         log(
-            f"  ✓ 本轮确认平面: {round_count}  |  "
-            f"丢弃: {n_rejected}  |  跳过: {n_skipped}",
+            f"  ✓ 掩码流转: 接受 {accepted_masks}  |  "
+            f"重叠丢弃: {overlap_discarded}  |  "
+            f"丢弃: {n_rejected}  |  跳过: {n_skipped}"
+            + (f"  |  空mask: {n_empty}" if n_empty > 0 else "")
+            + f"  |  总计: {accounted_masks}/{len(masks)}",
+            quiet=quiet,
+        )
+        log(
+            f"  ✓ 本轮确认平面: {round_count} 个"
+            f"  （来自 {accepted_masks} 个mask）",
             quiet=quiet,
         )
         log(f"  ✓ 累计确认平面: {len(confirmed_planes)} 个", quiet=quiet)
+        if accounted_masks != len(masks):
+            log(
+                f"  [WARN] 本轮统计未对齐: accounted={accounted_masks}, "
+                f"all_masks={len(masks)}",
+                quiet=quiet,
+            )
 
         # ── 保存本轮 debug ────────────────────────────────────────────────
         if debug_dir is not None:
@@ -1190,6 +1249,7 @@ def detect_planes_iterative(
                 remaining.copy(),
                 masks,
                 evaluated_records,
+                round_stats,
                 confirmed_planes,
                 color_masks_np,
                 normal_rgb_np,
